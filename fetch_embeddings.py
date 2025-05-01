@@ -73,34 +73,114 @@ def setup_model_and_tokenizer(model_name_or_path, device):
     print("Model and tokenizer loaded successfully.")
     return model, tokenizer
 
+# texts = ["第一句话。", "这是第二句，它更长一些。"]
 def get_embeddings(texts, model, tokenizer, device, batch_size=32, max_length=512):
-    """Generates embeddings for a list of texts using mean pooling."""
+    """
+    获取文本列表的 embeddings。
+    ... (函数文档字符串省略) ...
+    """
+    # 1. 初始化一个列表，用来收集所有批次处理后的 embedding 结果
     all_embeddings = []
-    model.eval() # Ensure model is in eval mode
+    # 确保模型在正确的设备上 (如果用了 device_map='auto'，这步可能不是必须的，但显式指定无害)
+    # model.to(device) # 如果 device_map='auto'，模型可能已分布在多设备
 
+    # 2. 批处理循环：为了高效处理大量数据并控制内存使用，我们分批处理文本
+    # tqdm(...) 提供一个进度条
     for i in tqdm(range(0, len(texts), batch_size), desc="Generating Embeddings"):
+        # 获取当前批次的文本
         batch_texts = texts[i:i+batch_size]
-        inputs = tokenizer(
-            batch_texts,
-            padding=True,
-            truncation=True,
-            max_length=max_length,
-            return_tensors="pt"
-        ).to(device) # Move inputs to the correct device
 
+        # 3. 分词 (Tokenization): 将文本字符串转换为模型能理解的数字 ID
+        # 这是非常关键的一步
+        inputs = tokenizer(
+            batch_texts,          # 输入当前批次的文本列表
+            padding=True,         # <--- 重要：填充 (Padding)
+                                  #      使得这个批次内的所有序列都具有相同的长度
+                                  #      (等于批次中最长序列的长度)。
+                                  #      用特殊的 padding token ID 来填充。
+            truncation=True,      # <--- 重要：截断 (Truncation)
+                                  #      如果序列超过 max_length，就把它截断。
+                                  #      防止序列过长导致内存溢出或超出模型处理能力。
+            max_length=max_length,  # 指定最大序列长度
+            return_tensors="pt"   # 返回 PyTorch 张量 (Tensor)
+        ).to(device) # 将生成的张量移动到指定设备 (CPU 或 GPU)
+
+        # `inputs` 现在是一个字典，通常包含：
+        # - 'input_ids': 形状是 (batch_size, sequence_length)，每个数字是 token 的 ID。
+        # - 'attention_mask': 形状是 (batch_size, sequence_length)，
+        #                    值为 1 的位置是真实的 token，值为 0 的位置是 padding token。
+        #                    这个 mask 非常重要，后续会用它来区分真实内容和填充物。
+        # (可能还有 'token_type_ids' 等，取决于模型)
+
+        # 4. 模型推理 (Inference): 将 token 输入模型，获取输出
+        # `torch.no_grad()` 表示我们不需要计算梯度 (因为不是在训练)，可以节省计算和内存
         with torch.no_grad():
+            # 将分词后的输入 (`inputs`) 传入模型
+            # `**inputs` 是 Python 的解包语法，相当于 model(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'], ...)
             outputs = model(**inputs, output_hidden_states=False)
 
-        # Mean Pooling Calculation
-        last_hidden_states = outputs.last_hidden_state
-        attention_mask = inputs['attention_mask']
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
-        sum_embeddings = torch.sum(last_hidden_states * input_mask_expanded, 1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-        mean_pooled_embeddings = sum_embeddings / sum_mask
+            # `outputs` 是一个包含模型输出的对象。我们最关心的是 `last_hidden_state`。
+            # `last_hidden_state` 的形状是: (batch_size, sequence_length, hidden_size)
+            # - batch_size: 当前批次中的句子数量。
+            # - sequence_length: 经过 padding/truncation 后，这个批次中所有序列的统一长度。
+            # - hidden_size: 模型隐藏层的大小 (例如 768, 1024, 4096 等)。这是每个 token 的向量维度。
+            #
+            # !!! 理解关键点 !!!
+            # 到这里，模型为 *每个句子* 中的 *每个 token* (包括 padding token) 都生成了一个 `hidden_size` 维度的向量。
+            # 例如，如果 batch_size=2, sequence_length=10, hidden_size=768，
+            # 那么 `last_hidden_state` 的形状就是 (2, 10, 768)。
+            # 我们现在有 2 个句子的 token 向量表示，但每个句子是由 10 个 768 维的向量组成的。
+            # 我们的目标是：为每个句子生成 *一个* 768 维的向量。
 
+        # 5. 池化操作 (Pooling): 从每个序列的多个 token 向量中计算出一个单一的序列向量
+        #    这里我们使用 Mean Pooling (平均池化) 策略。
+        #    目标：计算每个句子所有 *非填充* token 的 hidden state 的平均值。
+
+        # 5a. 获取最后一层的隐藏状态
+        last_hidden_states = outputs.last_hidden_state # Shape: (batch_size, sequence_length, hidden_size)
+
+        # 5b. 获取 Attention Mask，它告诉我们哪些是真实 token (1)，哪些是 padding (0)
+        attention_mask = inputs['attention_mask']      # Shape: (batch_size, sequence_length)
+
+        # 5c. 为了利用 attention_mask 来屏蔽 padding token 的 hidden state，我们需要扩展 mask 的维度
+        #     unsqueeze(-1) 在最后增加一个维度: (batch_size, sequence_length) -> (batch_size, sequence_length, 1)
+        #     expand(...) 将最后一个维度扩展到 hidden_size: (batch_size, sequence_length, 1) -> (batch_size, sequence_length, hidden_size)
+        #     这样 mask 就和 last_hidden_states 的形状一样了。
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_states.size()).float()
+
+        # 5d. 将 padding token 的 hidden state 置零
+        #     通过逐元素相乘，真实 token 的 hidden state 乘以 1 (不变)，padding token 的 hidden state 乘以 0 (变为零)。
+        masked_hidden_states = last_hidden_states * input_mask_expanded # Shape: (batch_size, sequence_length, hidden_size)
+
+        # 5e. 计算每个序列的 *有效* hidden state 的总和
+        #     torch.sum(..., 1) 在 sequence_length 维度上求和。
+        #     结果 sum_embeddings 的形状是 (batch_size, hidden_size)。
+        #     现在，每个句子的向量是其所有非填充 token 向量的和。
+        sum_embeddings = torch.sum(masked_hidden_states, 1)
+
+        # 5f. 计算每个序列中 *有效* token 的数量
+        #     我们直接对 expanded mask 在 sequence_length 维度上求和。
+        #     注意：这里求和的是 mask (0 或 1)，所以结果是每个序列中 1 的数量，即有效 token 的数量。
+        #     clamp(min=1e-9) 是为了防止除以零（如果一个序列全是 padding，虽然不太可能）。
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9) # Shape: (batch_size, hidden_size)
+
+        # 5g. 计算平均值：用总和除以数量
+        #     这得到了每个句子的 Mean Pooling Embedding。
+        mean_pooled_embeddings = sum_embeddings / sum_mask # Shape: (batch_size, hidden_size)
+        # !!! 理解关键点 !!!
+        # 经过这步 Mean Pooling，我们成功地将每个句子的表示从 (sequence_length, hidden_size) 压缩成了 (hidden_size)。
+        # `mean_pooled_embeddings` 现在包含了当前批次中每个句子的单一向量表示。
+
+        # 6. 收集结果
+        #    将计算得到的当前批次的 embeddings (PyTorch Tensor) 转移到 CPU，
+        #    并转换为 NumPy 数组 (更通用的格式，方便后续处理如 scikit-learn 聚类)，
+        #    然后添加到 `all_embeddings` 列表中。
         all_embeddings.append(mean_pooled_embeddings.cpu().numpy())
 
+    # 7. 合并所有批次的结果
+    #    当循环结束后，`all_embeddings` 是一个包含多个 NumPy 数组 (每个代表一个批次) 的列表。
+    #    `np.concatenate(..., axis=0)` 将这些数组沿着第一个维度 (批次维度) 拼接起来，
+    #    形成一个大的 NumPy 数组，形状为 (总文本数量, hidden_size)。
     return np.concatenate(all_embeddings, axis=0)
 
 def perform_clustering(embeddings, n_clusters, random_state=0):
