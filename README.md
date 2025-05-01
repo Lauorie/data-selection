@@ -255,6 +255,9 @@ python data-clean/src/fetch_embeddings.py \
 
 *   一个图像文件 (例如 `embeddings_tsne.png` 或 `embeddings_umap.png`)，展示了降维后的 embedding 散点图，点按聚类标签着色。
 
+## t-SNE 展示
+![tsne](embeddings_tsne.png)
+
 ## 配置参数
 
 两个脚本都提供了多个命令行参数来自定义其行为。使用 `-h` 或 `--help` 查看详细信息：
